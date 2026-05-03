@@ -147,8 +147,9 @@ private final class FTPSession: @unchecked Sendable {
     private var passiveDataEndpoint: PassiveDataEndpoint?
     private var activeDataEndpoint: NWEndpoint?
     private var restartOffset: UInt64 = 0
-    private let activeTransferLock = NSLock()
-    private var activeTransfer: ActiveDataTransfer?
+    private let transferStateLock = NSLock()
+    private var pendingTransfers: [PendingDataTransfer] = []
+    private var activeTransfers: [ActiveDataTransfer] = []
 
     init(connection: NWConnection, configuration: FTPServerConfiguration, logStore: LogStore, transferLimiter: TransferLimiter) {
         self.connection = connection
@@ -177,7 +178,8 @@ private final class FTPSession: @unchecked Sendable {
     }
 
     func close() {
-        cancelActiveTransfer()
+        cancelPendingTransfers()
+        cancelActiveTransfers()
         passiveDataEndpoint?.cancel()
         connection.cancel()
     }
@@ -270,7 +272,7 @@ private final class FTPSession: @unchecked Sendable {
         case .pasv:
             openPassiveMode()
         case .epsv:
-            openExtendedPassiveMode()
+            openExtendedPassiveMode(command.argument)
         case .port:
             configureActiveMode(command.argument)
         case .list:
@@ -367,7 +369,11 @@ private final class FTPSession: @unchecked Sendable {
         }
     }
 
-    private func openExtendedPassiveMode() {
+    private func openExtendedPassiveMode(_ argument: String?) {
+        if argument?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "ALL" {
+            send("200 EPSV ALL ok")
+            return
+        }
         do {
             passiveDataEndpoint?.cancel()
             let endpoint = try PassiveDataEndpoint(queue: queue)
@@ -472,11 +478,12 @@ private final class FTPSession: @unchecked Sendable {
 
     private func abortTransfer() {
         restartOffset = 0
-        let didCancelTransfer = cancelActiveTransfer()
+        let didCancelPendingTransfer = cancelPendingTransfers()
+        let didCancelActiveTransfer = cancelActiveTransfers()
         passiveDataEndpoint?.cancel()
         passiveDataEndpoint = nil
         activeDataEndpoint = nil
-        if didCancelTransfer {
+        if didCancelPendingTransfer || didCancelActiveTransfer {
             send("426 Transfer aborted")
         }
         send("226 Abort successful")
@@ -584,8 +591,15 @@ private final class FTPSession: @unchecked Sendable {
     }
 
     private func sendData(_ data: Data, openingReply: String, closingReply: String) {
+        let pendingTransfer = PendingDataTransfer()
+        installPendingTransfer(pendingTransfer)
         transferLimiter.acquire { [weak self] permit in
             guard let self else {
+                permit.release()
+                return
+            }
+            guard !pendingTransfer.isCancelled else {
+                self.clearPendingTransfer(pendingTransfer)
                 permit.release()
                 return
             }
@@ -596,14 +610,25 @@ private final class FTPSession: @unchecked Sendable {
                     dataConnection.cancel()
                     return
                 }
+                guard !pendingTransfer.isCancelled else {
+                    self.clearPendingTransfer(pendingTransfer)
+                    permit.release()
+                    dataConnection.cancel()
+                    return
+                }
+                self.clearPendingTransfer(pendingTransfer)
                 let transfer = ActiveDataTransfer(connection: dataConnection, permit: permit)
                 self.installActiveTransfer(transfer)
                 self.sendChunks(data, offset: 0, transfer: transfer, closingReply: closingReply)
             } onTimeout: { [weak self] in
+                self?.clearPendingTransfer(pendingTransfer)
                 permit.release()
-                self?.send("425 Data connection timed out")
+                if pendingTransfer.isCancelled == false {
+                    self?.send("425 Data connection timed out")
+                }
             }
             if !didStart {
+                self.clearPendingTransfer(pendingTransfer)
                 permit.release()
             }
         }
@@ -637,26 +662,49 @@ private final class FTPSession: @unchecked Sendable {
     }
 
     private func installActiveTransfer(_ transfer: ActiveDataTransfer) {
-        activeTransferLock.lock()
-        activeTransfer = transfer
-        activeTransferLock.unlock()
+        transferStateLock.lock()
+        activeTransfers.append(transfer)
+        transferStateLock.unlock()
     }
 
     private func clearActiveTransfer(_ transfer: ActiveDataTransfer) {
-        activeTransferLock.lock()
-        if activeTransfer === transfer {
-            activeTransfer = nil
-        }
-        activeTransferLock.unlock()
+        transferStateLock.lock()
+        activeTransfers.removeAll { $0 === transfer }
+        transferStateLock.unlock()
     }
 
     @discardableResult
-    private func cancelActiveTransfer() -> Bool {
-        activeTransferLock.lock()
-        let transfer = activeTransfer
-        activeTransfer = nil
-        activeTransferLock.unlock()
-        return transfer?.finish() == true
+    private func cancelActiveTransfers() -> Bool {
+        transferStateLock.lock()
+        let transfers = activeTransfers
+        activeTransfers.removeAll()
+        transferStateLock.unlock()
+        return transfers.reduce(false) { didCancel, transfer in
+            transfer.finish() || didCancel
+        }
+    }
+
+    private func installPendingTransfer(_ transfer: PendingDataTransfer) {
+        transferStateLock.lock()
+        pendingTransfers.append(transfer)
+        transferStateLock.unlock()
+    }
+
+    private func clearPendingTransfer(_ transfer: PendingDataTransfer) {
+        transferStateLock.lock()
+        pendingTransfers.removeAll { $0 === transfer }
+        transferStateLock.unlock()
+    }
+
+    @discardableResult
+    private func cancelPendingTransfers() -> Bool {
+        transferStateLock.lock()
+        let transfers = pendingTransfers
+        pendingTransfers.removeAll()
+        transferStateLock.unlock()
+        return transfers.reduce(false) { didCancel, transfer in
+            transfer.cancel() || didCancel
+        }
     }
 
     private func receiveData(openingReply: String, closingReply: String, writer: @escaping @Sendable (Data) throws -> Void) {
@@ -807,6 +855,28 @@ private final class DataAccumulator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+}
+
+private final class PendingDataTransfer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() -> Bool {
+        lock.lock()
+        guard !cancelled else {
+            lock.unlock()
+            return false
+        }
+        cancelled = true
+        lock.unlock()
+        return true
     }
 }
 

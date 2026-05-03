@@ -105,6 +105,24 @@ struct FTPServerIntegrationTests {
         server.stop()
     }
 
+    @Test("acknowledges EPSV ALL without opening a data listener")
+    func acknowledgesExtendedPassiveAll() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+        try client.send("EPSV ALL")
+
+        #expect(try client.readLine().hasPrefix("200"))
+        try client.send("EPSV")
+        let passiveReply = try client.readLine()
+        _ = try FTPTestClient(port: extendedPassivePort(from: passiveReply))
+        server.stop()
+    }
+
     @Test("lists files with MLSD for modern clients")
     func listsFilesWithMachineListing() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
@@ -221,6 +239,40 @@ struct FTPServerIntegrationTests {
         #expect(try client.readLine(timeout: 5).hasPrefix("426"))
         #expect(try client.readLine(timeout: 5).hasPrefix("226"))
         downloadDataClient.close()
+        server.stop()
+    }
+
+    @Test("aborts every in-flight download on a reused control connection")
+    func abortsEveryInFlightDownloadOnReusedControlConnection() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x61, count: 8 * 1024 * 1024)
+        try payload.write(to: root.appendingPathComponent("payload.bin"))
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+
+        try client.send("PASV")
+        let firstDataClient = try FTPTestClient(port: passivePort(from: client.readLine()))
+        try client.send("RETR payload.bin")
+        #expect(try client.readLine().hasPrefix("150"))
+
+        try client.send("PASV")
+        let secondDataClient = try FTPTestClient(port: passivePort(from: client.readLine()))
+        try client.send("RETR payload.bin")
+        #expect(try client.readLine().hasPrefix("150"))
+
+        try client.send("ABOR")
+        #expect(try client.readLine(timeout: 5).hasPrefix("426"))
+        #expect(try client.readLine(timeout: 5).hasPrefix("226"))
+
+        _ = try? firstDataClient.readAllUntilClose(timeout: 1)
+        _ = try? secondDataClient.readAllUntilClose(timeout: 1)
+        try client.send("NOOP")
+
+        #expect(try client.readLine(timeout: 2) == "200 NOOP ok")
         server.stop()
     }
 
