@@ -147,6 +147,7 @@ private final class FTPSession: @unchecked Sendable {
     private var passiveDataEndpoint: PassiveDataEndpoint?
     private var activeDataEndpoint: NWEndpoint?
     private var restartOffset: UInt64 = 0
+    private var interruptedTransferAwaitingAbort = false
     private let transferStateLock = NSLock()
     private var pendingTransfers: [PendingDataTransfer] = []
     private var activeTransfers: [ActiveDataTransfer] = []
@@ -480,10 +481,12 @@ private final class FTPSession: @unchecked Sendable {
         restartOffset = 0
         let didCancelPendingTransfer = cancelPendingTransfers()
         let didCancelActiveTransfer = cancelActiveTransfers()
+        let didInterruptRecentTransfer = interruptedTransferAwaitingAbort
+        interruptedTransferAwaitingAbort = false
         passiveDataEndpoint?.cancel()
         passiveDataEndpoint = nil
         activeDataEndpoint = nil
-        if didCancelPendingTransfer || didCancelActiveTransfer {
+        if didCancelPendingTransfer || didCancelActiveTransfer || didInterruptRecentTransfer {
             send("426 Transfer aborted")
         }
         send("226 Abort successful")
@@ -623,6 +626,7 @@ private final class FTPSession: @unchecked Sendable {
                     }
                     self.clearPendingTransfer(pendingTransfer)
                     let transfer = ActiveDataTransfer(connection: dataConnection, permit: permit)
+                    self.interruptedTransferAwaitingAbort = false
                     self.installActiveTransfer(transfer)
                     self.sendChunks(data, offset: 0, transfer: transfer, closingReply: closingReply)
                 } onTimeout: { [weak self] in
@@ -645,6 +649,7 @@ private final class FTPSession: @unchecked Sendable {
         guard offset < data.count else {
             if transfer.finish() {
                 clearActiveTransfer(transfer)
+                interruptedTransferAwaitingAbort = false
                 send(closingReply)
                 Task {
                     await logStore.append(level: .info, category: .transfer, message: "sent \(data.count) bytes")
@@ -662,6 +667,7 @@ private final class FTPSession: @unchecked Sendable {
                 if error != nil {
                     if transfer.finish() {
                         self.clearActiveTransfer(transfer)
+                        self.interruptedTransferAwaitingAbort = true
                     }
                     return
                 }

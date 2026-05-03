@@ -317,6 +317,31 @@ struct FTPServerIntegrationTests {
         server.stop()
     }
 
+    @Test("reports aborted transfer after the client closes the data socket first")
+    func reportsAbortedTransferAfterClientClosesDataSocketFirst() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x61, count: 32 * 1024 * 1024)
+        try payload.write(to: root.appendingPathComponent("payload.bin"))
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+        try client.send("EPSV")
+        let dataClient = try FTPTestClient(port: extendedPassivePort(from: client.readLine()))
+        try client.send("RETR payload.bin")
+        #expect(try client.readLine().hasPrefix("150"))
+
+        dataClient.close()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try client.send("ABOR")
+
+        #expect(try client.readLine(timeout: 5).hasPrefix("426"))
+        #expect(try client.readLine(timeout: 5).hasPrefix("226"))
+        server.stop()
+    }
+
     @Test("renames directories with RNFR and RNTO")
     func renamesDirectories() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)

@@ -3,14 +3,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
-APP_DIR="$DIST_DIR/LocalFTP.app"
+APP_NAME="FTP Server 纪"
+APP_DIR="$DIST_DIR/$APP_NAME.app"
 EXECUTABLE="$ROOT_DIR/.build/release/LocalFTP"
 
 cd "$ROOT_DIR"
 swift scripts/generate_app_icon.swift
 swift build -c release
 
-rm -rf "$APP_DIR"
+rm -rf "$APP_DIR" "$DIST_DIR/LocalFTP.app" "$DIST_DIR/LocalFTP.app.zip" "$DIST_DIR/$APP_NAME.app.zip"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/LocalFTP"
 cp "$ROOT_DIR/Sources/LocalFTPApp/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
@@ -25,17 +26,17 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
     <key>CFBundleIdentifier</key>
     <string>dev.local.localftpserver</string>
     <key>CFBundleName</key>
-    <string>LocalFTP</string>
+    <string>FTP Server 纪</string>
     <key>CFBundleDisplayName</key>
-    <string>LocalFTP</string>
+    <string>FTP Server 纪</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.0.3</string>
+    <string>1.0.4</string>
     <key>CFBundleVersion</key>
-    <string>4</string>
+    <string>5</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -45,7 +46,7 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 PLIST
 
 codesign --force --deep --sign - "$APP_DIR" >/dev/null
-ditto -c -k --keepParent "$APP_DIR" "$DIST_DIR/LocalFTP.app.zip"
+ditto -c -k --keepParent "$APP_DIR" "$DIST_DIR/$APP_NAME.app.zip"
 
 echo "App: $APP_DIR"
-echo "Zip: $DIST_DIR/LocalFTP.app.zip"
+echo "Zip: $DIST_DIR/$APP_NAME.app.zip"

@@ -5,12 +5,21 @@ import SwiftUI
 
 @main
 struct LocalFTPApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
             ContentView()
                 .frame(minWidth: 780, minHeight: 560)
         }
+        .defaultSize(width: 780, height: 560)
         .windowStyle(.titleBar)
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
+        true
     }
 }
 
@@ -201,7 +210,7 @@ struct ContentView: View {
 
     private var toolbar: some View {
         HStack(spacing: 12) {
-            Text("Local FTP Server")
+            Text("FTP Server 纪")
                 .font(.title2.weight(.semibold))
             Spacer()
             Text(viewModel.statusText)

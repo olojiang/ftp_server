@@ -1,6 +1,6 @@
-# LocalFTPServer
+# FTP Server 纪
 
-LocalFTPServer 是一个纯 Swift 实现的 macOS 本地 FTP 服务应用。它提供图形界面，可以选择共享目录、配置端口、用户名和密码，并启动或关闭 FTP 服务。运行日志会实时显示在应用内，同时写入日志文件，方便排查连接、认证和文件传输问题。
+FTP Server 纪 是一个纯 Swift 实现的 macOS 本地 FTP 服务应用。它提供图形界面，可以选择共享目录、配置端口、用户名和密码，并启动或关闭 FTP 服务。运行日志会实时显示在应用内，同时写入日志文件，方便排查连接、认证和文件传输问题。
 
 ## 功能
 
@@ -40,13 +40,13 @@ swift run LocalFTP
 
 打包结果：
 
-- `dist/LocalFTP.app`
-- `dist/LocalFTP.app.zip`
+- `dist/FTP Server 纪.app`
+- `dist/FTP Server 纪.app.zip`
 
 ### 安装到 Applications
 
 ```bash
-cp -R dist/LocalFTP.app /Applications/
+cp -R "dist/FTP Server 纪.app" /Applications/
 ```
 
 ### 连接示例
