@@ -54,6 +54,20 @@ public actor LogStore {
         return storage.map(\.formatted).joined(separator: "\n")
     }
 
+    public func clear() {
+        storage.removeAll()
+        guard let fileURL else {
+            return
+        }
+        do {
+            let directory = fileURL.deletingLastPathComponent()
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try Data().write(to: fileURL)
+        } catch {
+            // Logging must not crash the FTP service.
+        }
+    }
+
     public func append(level: LogLevel, category: LogCategory, message: String) {
         let entry = LogEntry(id: UUID(), timestamp: Date(), level: level, category: category, message: message)
         storage.append(entry)

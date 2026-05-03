@@ -147,6 +147,8 @@ private final class FTPSession: @unchecked Sendable {
     private var passiveDataEndpoint: PassiveDataEndpoint?
     private var activeDataEndpoint: NWEndpoint?
     private var restartOffset: UInt64 = 0
+    private let activeTransferLock = NSLock()
+    private var activeTransfer: ActiveDataTransfer?
 
     init(connection: NWConnection, configuration: FTPServerConfiguration, logStore: LogStore, transferLimiter: TransferLimiter) {
         self.connection = connection
@@ -175,6 +177,7 @@ private final class FTPSession: @unchecked Sendable {
     }
 
     func close() {
+        cancelActiveTransfer()
         passiveDataEndpoint?.cancel()
         connection.cancel()
     }
@@ -469,9 +472,13 @@ private final class FTPSession: @unchecked Sendable {
 
     private func abortTransfer() {
         restartOffset = 0
+        let didCancelTransfer = cancelActiveTransfer()
         passiveDataEndpoint?.cancel()
         passiveDataEndpoint = nil
         activeDataEndpoint = nil
+        if didCancelTransfer {
+            send("426 Transfer aborted")
+        }
         send("226 Abort successful")
     }
 
@@ -583,15 +590,15 @@ private final class FTPSession: @unchecked Sendable {
                 return
             }
             self.send(openingReply)
-            let didStart = self.withDataConnection { dataConnection in
-                dataConnection.send(content: data, completion: .contentProcessed { [weak self] _ in
-                    dataConnection.cancel()
+            let didStart = self.withDataConnection { [weak self] dataConnection in
+                guard let self else {
                     permit.release()
-                    self?.send(closingReply)
-                    Task {
-                        await self?.logStore.append(level: .info, category: .transfer, message: "sent \(data.count) bytes")
-                    }
-                })
+                    dataConnection.cancel()
+                    return
+                }
+                let transfer = ActiveDataTransfer(connection: dataConnection, permit: permit)
+                self.installActiveTransfer(transfer)
+                self.sendChunks(data, offset: 0, transfer: transfer, closingReply: closingReply)
             } onTimeout: { [weak self] in
                 permit.release()
                 self?.send("425 Data connection timed out")
@@ -600,6 +607,56 @@ private final class FTPSession: @unchecked Sendable {
                 permit.release()
             }
         }
+    }
+
+    private func sendChunks(_ data: Data, offset: Int, transfer: ActiveDataTransfer, closingReply: String) {
+        guard !transfer.isFinished else { return }
+        guard offset < data.count else {
+            if transfer.finish() {
+                clearActiveTransfer(transfer)
+                send(closingReply)
+                Task {
+                    await logStore.append(level: .info, category: .transfer, message: "sent \(data.count) bytes")
+                }
+            }
+            return
+        }
+
+        let end = min(offset + 256 * 1024, data.count)
+        let chunk = data.subdata(in: offset..<end)
+        transfer.connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
+            guard let self else { return }
+            if error != nil {
+                if transfer.finish() {
+                    self.clearActiveTransfer(transfer)
+                }
+                return
+            }
+            self.sendChunks(data, offset: end, transfer: transfer, closingReply: closingReply)
+        })
+    }
+
+    private func installActiveTransfer(_ transfer: ActiveDataTransfer) {
+        activeTransferLock.lock()
+        activeTransfer = transfer
+        activeTransferLock.unlock()
+    }
+
+    private func clearActiveTransfer(_ transfer: ActiveDataTransfer) {
+        activeTransferLock.lock()
+        if activeTransfer === transfer {
+            activeTransfer = nil
+        }
+        activeTransferLock.unlock()
+    }
+
+    @discardableResult
+    private func cancelActiveTransfer() -> Bool {
+        activeTransferLock.lock()
+        let transfer = activeTransfer
+        activeTransfer = nil
+        activeTransferLock.unlock()
+        return transfer?.finish() == true
     }
 
     private func receiveData(openingReply: String, closingReply: String, writer: @escaping @Sendable (Data) throws -> Void) {
@@ -750,6 +807,38 @@ private final class DataAccumulator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+}
+
+private final class ActiveDataTransfer: @unchecked Sendable {
+    let connection: NWConnection
+    private let permit: TransferPermit
+    private let lock = NSLock()
+    private var finished = false
+
+    init(connection: NWConnection, permit: TransferPermit) {
+        self.connection = connection
+        self.permit = permit
+    }
+
+    var isFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return finished
+    }
+
+    func finish() -> Bool {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return false
+        }
+        finished = true
+        lock.unlock()
+
+        connection.cancel()
+        permit.release()
+        return true
     }
 }
 

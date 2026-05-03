@@ -45,4 +45,20 @@ struct LogStoreTests {
         #expect(contents.contains("[state] one"))
         #expect(contents.contains("[state] two"))
     }
+
+    @Test("clears in-memory and file logs")
+    func clearsMemoryAndFileLogs() async throws {
+        let fileURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("local-ftp-\(UUID().uuidString).log")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        let store = LogStore(maxEntries: 10, fileURL: fileURL)
+
+        await store.append(level: .info, category: .state, message: "old")
+        await store.clear()
+        let entries = await store.entries
+        let contents = await store.copyableContents()
+
+        #expect(entries.isEmpty)
+        #expect(contents.isEmpty)
+    }
 }

@@ -103,10 +103,12 @@ final class ServerViewModel: ObservableObject {
         )
         let server = FTPServer(configuration: configuration, logStore: logStore)
         self.server = server
+        logs = []
         statusText = "启动中..."
 
         Task {
             do {
+                await logStore.clear()
                 try server.start()
                 isRunning = true
                 let boundPort = try server.boundPort()

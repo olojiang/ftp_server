@@ -198,6 +198,32 @@ struct FTPServerIntegrationTests {
         server.stop()
     }
 
+    @Test("aborts an active download")
+    func abortsActiveDownload() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x61, count: 32 * 1024 * 1024)
+        try payload.write(to: root.appendingPathComponent("payload.bin"))
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+        try client.send("PASV")
+        let downloadPort = try passivePort(from: client.readLine())
+        let downloadDataClient = try FTPTestClient(port: downloadPort)
+        try client.send("RETR payload.bin")
+        #expect(try client.readLine().hasPrefix("150"))
+
+        try await Task.sleep(nanoseconds: 100_000_000)
+        try client.send("ABOR")
+
+        #expect(try client.readLine(timeout: 5).hasPrefix("426"))
+        #expect(try client.readLine(timeout: 5).hasPrefix("226"))
+        downloadDataClient.close()
+        server.stop()
+    }
+
     @Test("renames directories with RNFR and RNTO")
     func renamesDirectories() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
