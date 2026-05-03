@@ -1,0 +1,13 @@
+.DS_Store
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+*.app
+*.zip
+node_modules/
+.claude/
+.omx/state/
+.omx/logs/
+npm-debug.log*
+*.log
