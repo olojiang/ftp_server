@@ -1,17 +1,28 @@
 import Foundation
+import Darwin
 import Network
 
 public struct FTPServerConfiguration: Equatable, Sendable {
+    public static let defaultMaxConcurrentTransfers = 8
+
     public let rootDirectory: URL
     public let port: UInt16
     public let username: String
     public let password: String
+    public let maxConcurrentTransfers: Int
 
-    public init(rootDirectory: URL, port: UInt16, username: String, password: String) {
+    public init(
+        rootDirectory: URL,
+        port: UInt16,
+        username: String,
+        password: String,
+        maxConcurrentTransfers: Int = Self.defaultMaxConcurrentTransfers
+    ) {
         self.rootDirectory = rootDirectory
         self.port = port
         self.username = username
         self.password = password
+        self.maxConcurrentTransfers = max(1, maxConcurrentTransfers)
     }
 }
 
@@ -24,6 +35,7 @@ public final class FTPServer: @unchecked Sendable {
 
     private let configuration: FTPServerConfiguration
     private let logStore: LogStore
+    private let transferLimiter: TransferLimiter
     private let queue = DispatchQueue(label: "local-ftp.server")
     private let lock = NSLock()
     private var listener: NWListener?
@@ -33,6 +45,7 @@ public final class FTPServer: @unchecked Sendable {
     public init(configuration: FTPServerConfiguration, logStore: LogStore) {
         self.configuration = configuration
         self.logStore = logStore
+        self.transferLimiter = TransferLimiter(maxConcurrent: configuration.maxConcurrentTransfers)
     }
 
     public func start() throws {
@@ -58,7 +71,7 @@ public final class FTPServer: @unchecked Sendable {
                 self.currentPort = listener.port?.rawValue
                 self.lock.unlock()
                 Task {
-                    await self.logStore.append(level: .info, category: .state, message: "FTP server listening on port \(listener.port?.rawValue ?? 0), root=\(self.configuration.rootDirectory.path)")
+                    await self.logStore.append(level: .info, category: .state, message: "FTP server listening on port \(listener.port?.rawValue ?? 0), root=\(self.configuration.rootDirectory.path), maxTransfers=\(self.configuration.maxConcurrentTransfers)")
                 }
                 startup.signal()
             case .failed(let error):
@@ -111,7 +124,7 @@ public final class FTPServer: @unchecked Sendable {
     }
 
     private func accept(_ connection: NWConnection) {
-        let session = FTPSession(connection: connection, configuration: configuration, logStore: logStore)
+        let session = FTPSession(connection: connection, configuration: configuration, logStore: logStore, transferLimiter: transferLimiter)
         lock.lock()
         sessions.append(session)
         lock.unlock()
@@ -124,19 +137,22 @@ private final class FTPSession: @unchecked Sendable {
     private let configuration: FTPServerConfiguration
     private let logStore: LogStore
     private let resolver: FTPPathResolver
+    private let transferLimiter: TransferLimiter
     private let queue = DispatchQueue(label: "local-ftp.session.\(UUID().uuidString)")
     private var buffer = Data()
     private var username: String?
     private var authenticated = false
     private var currentDirectory = "/"
+    private var pendingRenameSource: ResolvedFTPPath?
     private var passiveDataEndpoint: PassiveDataEndpoint?
     private var activeDataEndpoint: NWEndpoint?
 
-    init(connection: NWConnection, configuration: FTPServerConfiguration, logStore: LogStore) {
+    init(connection: NWConnection, configuration: FTPServerConfiguration, logStore: LogStore, transferLimiter: TransferLimiter) {
         self.connection = connection
         self.configuration = configuration
         self.logStore = logStore
         self.resolver = FTPPathResolver(root: configuration.rootDirectory)
+        self.transferLimiter = transferLimiter
     }
 
     func start() {
@@ -225,7 +241,7 @@ private final class FTPSession: @unchecked Sendable {
         case .syst:
             send("215 UNIX Type: L8")
         case .feat:
-            sendMultiline("211", lines: ["UTF8", "SIZE", "MDTM", "PASV"], end: "Features")
+            sendMultiline("211", lines: ["UTF8", "SIZE", "MDTM", "MLST type*;size*;modify*;", "PASV", "EPSV"], end: "Features")
         case .noop:
             send("200 NOOP ok")
         case .type:
@@ -249,12 +265,18 @@ private final class FTPSession: @unchecked Sendable {
             changeDirectory("..")
         case .pasv:
             openPassiveMode()
+        case .epsv:
+            openExtendedPassiveMode()
         case .port:
             configureActiveMode(command.argument)
         case .list:
             sendDirectoryListing(nameOnly: false, path: command.argument)
         case .nlst:
             sendDirectoryListing(nameOnly: true, path: command.argument)
+        case .mlsd:
+            sendMachineDirectoryListing(command.argument)
+        case .mlst:
+            machineList(command.argument)
         case .retr:
             retrieve(command.argument)
         case .stor:
@@ -265,6 +287,10 @@ private final class FTPSession: @unchecked Sendable {
             makeDirectory(command.argument)
         case .rmd:
             removeDirectory(command.argument)
+        case .rnfr:
+            renameFrom(command.argument)
+        case .rnto:
+            renameTo(command.argument)
         case .size:
             size(command.argument)
         case .mdtm:
@@ -302,9 +328,49 @@ private final class FTPSession: @unchecked Sendable {
             }
             let p1 = port / 256
             let p2 = port % 256
-            send("227 Entering Passive Mode (127,0,0,1,\(p1),\(p2))")
+            let hostTuple = passiveModeHost().replacingOccurrences(of: ".", with: ",")
+            send("227 Entering Passive Mode (\(hostTuple),\(p1),\(p2))")
             Task {
-                await logStore.append(level: .info, category: .transfer, message: "passive data listener opened on port \(port)")
+                await logStore.append(level: .info, category: .transfer, message: "passive data listener opened on \(hostTuple.replacingOccurrences(of: ",", with: ".")):\(port)")
+            }
+        } catch {
+            send("425 Cannot open passive connection")
+        }
+    }
+
+    private func passiveModeHost() -> String {
+        guard let remoteAddress = remoteIPv4Address(), !remoteAddress.hasPrefix("127.") else {
+            return "127.0.0.1"
+        }
+        return localIPv4AddressForRoute(to: remoteAddress) ?? LocalIPv4AddressProvider.preferredAddress() ?? "127.0.0.1"
+    }
+
+    private func remoteIPv4Address() -> String? {
+        guard case .hostPort(let host, _) = connection.endpoint else {
+            return nil
+        }
+        switch host {
+        case .ipv4(let address):
+            return "\(address)"
+        case .name(let name, _):
+            return name
+        default:
+            return nil
+        }
+    }
+
+    private func openExtendedPassiveMode() {
+        do {
+            passiveDataEndpoint?.cancel()
+            let endpoint = try PassiveDataEndpoint(queue: queue)
+            passiveDataEndpoint = endpoint
+            guard let port = endpoint.port else {
+                send("425 Cannot open passive connection")
+                return
+            }
+            send("229 Entering Extended Passive Mode (|||\(port)|)")
+            Task {
+                await logStore.append(level: .info, category: .transfer, message: "extended passive data listener opened on port \(port)")
             }
         } catch {
             send("425 Cannot open passive connection")
@@ -337,6 +403,35 @@ private final class FTPSession: @unchecked Sendable {
             sendData(Data(listing.utf8), openingReply: "150 Opening data connection", closingReply: "226 Transfer complete")
         } catch {
             send("550 Cannot list directory")
+        }
+    }
+
+    private func sendMachineDirectoryListing(_ path: String?) {
+        do {
+            let resolved = try resolver.resolve(path, currentDirectory: currentDirectory)
+            let items = try FileManager.default.contentsOfDirectory(
+                at: resolved.fileURL,
+                includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey]
+            )
+            let listing = items.map { item in
+                "\(formatMachineListFacts(item)) \(item.lastPathComponent)"
+            }.joined(separator: "\r\n") + "\r\n"
+            sendData(Data(listing.utf8), openingReply: "150 Opening data connection for MLSD", closingReply: "226 Transfer complete")
+        } catch {
+            send("550 Cannot list directory")
+        }
+    }
+
+    private func machineList(_ path: String?) {
+        do {
+            let resolved = try resolver.resolve(path, currentDirectory: currentDirectory)
+            guard FileManager.default.fileExists(atPath: resolved.fileURL.path) else {
+                send("550 Path not found")
+                return
+            }
+            sendMultiline("250", lines: ["\(formatMachineListFacts(resolved.fileURL)) \(resolved.ftpPath)"], end: "Listing")
+        } catch {
+            send("550 Cannot list path")
         }
     }
 
@@ -391,6 +486,38 @@ private final class FTPSession: @unchecked Sendable {
         }
     }
 
+    private func renameFrom(_ path: String?) {
+        do {
+            let resolved = try resolver.resolve(path, currentDirectory: currentDirectory)
+            guard FileManager.default.fileExists(atPath: resolved.fileURL.path) else {
+                pendingRenameSource = nil
+                send("550 Path not found")
+                return
+            }
+            pendingRenameSource = resolved
+            send("350 Ready for RNTO")
+        } catch {
+            pendingRenameSource = nil
+            send("550 Cannot rename path")
+        }
+    }
+
+    private func renameTo(_ path: String?) {
+        guard let source = pendingRenameSource else {
+            send("503 Bad sequence of commands")
+            return
+        }
+        pendingRenameSource = nil
+
+        do {
+            let destination = try resolver.resolve(path, currentDirectory: currentDirectory)
+            try FileManager.default.moveItem(at: source.fileURL, to: destination.fileURL)
+            send("250 Rename successful")
+        } catch {
+            send("550 Cannot rename path")
+        }
+    }
+
     private func size(_ path: String?) {
         do {
             let resolved = try resolver.resolve(path, currentDirectory: currentDirectory)
@@ -420,52 +547,84 @@ private final class FTPSession: @unchecked Sendable {
     }
 
     private func sendData(_ data: Data, openingReply: String, closingReply: String) {
-        send(openingReply)
-        withDataConnection { dataConnection in
-            dataConnection.send(content: data, completion: .contentProcessed { [weak self] _ in
-                dataConnection.cancel()
-                self?.send(closingReply)
-                Task {
-                    await self?.logStore.append(level: .info, category: .transfer, message: "sent \(data.count) bytes")
-                }
-            })
+        transferLimiter.acquire { [weak self] permit in
+            guard let self else {
+                permit.release()
+                return
+            }
+            self.send(openingReply)
+            let didStart = self.withDataConnection { dataConnection in
+                dataConnection.send(content: data, completion: .contentProcessed { [weak self] _ in
+                    dataConnection.cancel()
+                    permit.release()
+                    self?.send(closingReply)
+                    Task {
+                        await self?.logStore.append(level: .info, category: .transfer, message: "sent \(data.count) bytes")
+                    }
+                })
+            } onTimeout: { [weak self] in
+                permit.release()
+                self?.send("425 Data connection timed out")
+            }
+            if !didStart {
+                permit.release()
+            }
         }
     }
 
     private func receiveData(openingReply: String, closingReply: String, writer: @escaping @Sendable (Data) throws -> Void) {
-        send(openingReply)
-        withDataConnection { [weak self] dataConnection in
-            guard let session = self else { return }
-            let accumulator = DataAccumulator()
-            let logStore = session.logStore
-            @Sendable func receiveLoop() {
-                dataConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, _ in
-                    if let data {
-                        accumulator.append(data)
-                    }
-                    if isComplete {
-                        let received = accumulator.data()
-                        do {
-                            try writer(received)
-                            session.send(closingReply)
-                            let byteCount = received.count
-                            Task {
-                                await logStore.append(level: .info, category: .transfer, message: "received \(byteCount) bytes")
-                            }
-                        } catch {
-                            session.send("550 Cannot save uploaded data")
+        transferLimiter.acquire { [weak self] permit in
+            guard let self else {
+                permit.release()
+                return
+            }
+            self.send(openingReply)
+            let didStart = self.withDataConnection { [weak self] dataConnection in
+                guard let session = self else {
+                    permit.release()
+                    return
+                }
+                let accumulator = DataAccumulator()
+                let logStore = session.logStore
+                @Sendable func receiveLoop() {
+                    dataConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, _ in
+                        if let data {
+                            accumulator.append(data)
                         }
-                        dataConnection.cancel()
-                    } else {
-                        receiveLoop()
+                        if isComplete {
+                            let received = accumulator.data()
+                            do {
+                                try writer(received)
+                                session.send(closingReply)
+                                let byteCount = received.count
+                                Task {
+                                    await logStore.append(level: .info, category: .transfer, message: "received \(byteCount) bytes")
+                                }
+                            } catch {
+                                session.send("550 Cannot save uploaded data")
+                            }
+                            permit.release()
+                            dataConnection.cancel()
+                        } else {
+                            receiveLoop()
+                        }
                     }
                 }
+                receiveLoop()
+            } onTimeout: { [weak self] in
+                permit.release()
+                self?.send("425 Data connection timed out")
             }
-            receiveLoop()
+            if !didStart {
+                permit.release()
+            }
         }
     }
 
-    private func withDataConnection(_ body: @escaping @Sendable (NWConnection) -> Void) {
+    private func withDataConnection(
+        _ body: @escaping @Sendable (NWConnection) -> Void,
+        onTimeout: @escaping @Sendable () -> Void
+    ) -> Bool {
         if let endpoint = activeDataEndpoint {
             activeDataEndpoint = nil
             let dataConnection = NWConnection(to: endpoint, using: .tcp)
@@ -475,18 +634,23 @@ private final class FTPSession: @unchecked Sendable {
                 }
             }
             dataConnection.start(queue: queue)
-            return
+            return true
         }
 
         guard let passiveDataEndpoint else {
             send("425 Use PASV or PORT first")
-            return
+            return false
         }
         passiveDataEndpoint.acquire { [weak self] connection in
             body(connection)
             self?.passiveDataEndpoint?.cancel()
             self?.passiveDataEndpoint = nil
+        } onTimeout: { [weak self] in
+            self?.passiveDataEndpoint?.cancel()
+            self?.passiveDataEndpoint = nil
+            onTimeout()
         }
+        return true
     }
 
     private func send(_ line: String) {
@@ -523,6 +687,17 @@ private final class FTPSession: @unchecked Sendable {
         return "\(permissions) 1 owner group \(size) \(date) \(url.lastPathComponent)"
     }
 
+    private func formatMachineListFacts(_ url: URL) -> String {
+        let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey])
+        let type = values?.isDirectory == true ? "dir" : "file"
+        let size = values?.fileSize ?? 0
+        let formatter = DateFormatter()
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMddHHmmss"
+        let modified = formatter.string(from: values?.contentModificationDate ?? Date())
+        return "type=\(type);size=\(size);modify=\(modified);"
+    }
+
     private func redacted(_ line: String) -> String {
         if line.uppercased().hasPrefix("PASS") {
             return "PASS ******"
@@ -545,6 +720,143 @@ private final class DataAccumulator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return storage
+    }
+}
+
+private final class TransferLimiter: @unchecked Sendable {
+    private let semaphore: DispatchSemaphore
+    private let queue = DispatchQueue(label: "local-ftp.transfer-limiter", attributes: .concurrent)
+
+    init(maxConcurrent: Int) {
+        semaphore = DispatchSemaphore(value: max(1, maxConcurrent))
+    }
+
+    func acquire(_ body: @escaping @Sendable (TransferPermit) -> Void) {
+        queue.async {
+            self.semaphore.wait()
+            body(TransferPermit(semaphore: self.semaphore))
+        }
+    }
+}
+
+private final class TransferPermit: @unchecked Sendable {
+    private let semaphore: DispatchSemaphore
+    private let lock = NSLock()
+    private var isReleased = false
+
+    init(semaphore: DispatchSemaphore) {
+        self.semaphore = semaphore
+    }
+
+    func release() {
+        lock.lock()
+        guard !isReleased else {
+            lock.unlock()
+            return
+        }
+        isReleased = true
+        lock.unlock()
+        semaphore.signal()
+    }
+
+    deinit {
+        release()
+    }
+}
+
+private func localIPv4AddressForRoute(to remoteAddress: String) -> String? {
+    let fileDescriptor = socket(AF_INET, SOCK_DGRAM, 0)
+    guard fileDescriptor >= 0 else {
+        return nil
+    }
+    defer { close(fileDescriptor) }
+
+    var remote = sockaddr_in()
+    remote.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    remote.sin_family = sa_family_t(AF_INET)
+    remote.sin_port = in_port_t(9).bigEndian
+    guard inet_pton(AF_INET, remoteAddress, &remote.sin_addr) == 1 else {
+        return nil
+    }
+
+    let connectResult = withUnsafePointer(to: &remote) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            Darwin.connect(fileDescriptor, socketAddress, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard connectResult == 0 else {
+        return nil
+    }
+
+    var local = sockaddr_in()
+    var localLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameResult = withUnsafeMutablePointer(to: &local) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { socketAddress in
+            getsockname(fileDescriptor, socketAddress, &localLength)
+        }
+    }
+    guard nameResult == 0 else {
+        return nil
+    }
+
+    var address = local.sin_addr
+    var buffer = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+    guard inet_ntop(AF_INET, &address, &buffer, socklen_t(INET_ADDRSTRLEN)) != nil else {
+        return nil
+    }
+    return buffer.withUnsafeBufferPointer { pointer in
+        String(cString: pointer.baseAddress!)
+    }
+}
+
+private enum LocalIPv4AddressProvider {
+    static func preferredAddress() -> String? {
+        var addresses: [(name: String, host: String)] = []
+        var interfaces: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&interfaces) == 0, let firstInterface = interfaces else {
+            return nil
+        }
+        defer { freeifaddrs(interfaces) }
+
+        var cursor: UnsafeMutablePointer<ifaddrs>? = firstInterface
+        while let interface = cursor?.pointee {
+            defer { cursor = interface.ifa_next }
+
+            let flags = Int32(interface.ifa_flags)
+            guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
+            guard let address = interface.ifa_addr, address.pointee.sa_family == UInt8(AF_INET) else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            let result = getnameinfo(
+                address,
+                socklen_t(address.pointee.sa_len),
+                &hostname,
+                socklen_t(hostname.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            )
+            guard result == 0 else { continue }
+
+            let host = hostname.withUnsafeBufferPointer { buffer in
+                String(cString: buffer.baseAddress!)
+            }
+            guard !host.hasPrefix("169.254.") else { continue }
+            addresses.append((name: String(cString: interface.ifa_name), host: host))
+        }
+
+        return addresses.sorted { lhs, rhs in
+            addressRank(lhs.name) == addressRank(rhs.name)
+                ? lhs.host < rhs.host
+                : addressRank(lhs.name) < addressRank(rhs.name)
+        }.first?.host
+    }
+
+    private static func addressRank(_ interfaceName: String) -> Int {
+        if interfaceName.hasPrefix("en") { return 0 }
+        if interfaceName.hasPrefix("bridge") { return 1 }
+        if interfaceName.hasPrefix("utun") || interfaceName.hasPrefix("ppp") { return 2 }
+        return 3
     }
 }
 
@@ -592,7 +904,10 @@ private final class PassiveDataEndpoint: @unchecked Sendable {
         }
     }
 
-    func acquire(_ handler: @escaping @Sendable (NWConnection) -> Void) {
+    func acquire(
+        _ handler: @escaping @Sendable (NWConnection) -> Void,
+        onTimeout: @escaping @Sendable () -> Void
+    ) {
         lock.lock()
         if let connection = pendingConnection {
             pendingConnection = nil
@@ -602,6 +917,18 @@ private final class PassiveDataEndpoint: @unchecked Sendable {
         }
         pendingHandler = handler
         lock.unlock()
+
+        queue.asyncAfter(deadline: .now() + 15) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard self.pendingHandler != nil else {
+                self.lock.unlock()
+                return
+            }
+            self.pendingHandler = nil
+            self.lock.unlock()
+            onTimeout()
+        }
     }
 
     func cancel() {

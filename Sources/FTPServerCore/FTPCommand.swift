@@ -12,14 +12,19 @@ public enum FTPCommandVerb: Equatable, Sendable {
     case noop
     case feat
     case pasv
+    case epsv
     case port
     case list
     case nlst
+    case mlsd
+    case mlst
     case retr
     case stor
     case dele
     case mkd
     case rmd
+    case rnfr
+    case rnto
     case size
     case mdtm
     case unknown(String)
@@ -70,14 +75,19 @@ public enum FTPCommandParser {
         case "NOOP": .noop
         case "FEAT": .feat
         case "PASV": .pasv
+        case "EPSV": .epsv
         case "PORT": .port
         case "LIST": .list
         case "NLST": .nlst
+        case "MLSD": .mlsd
+        case "MLST": .mlst
         case "RETR": .retr
         case "STOR": .stor
         case "DELE": .dele
         case "MKD": .mkd
         case "RMD": .rmd
+        case "RNFR": .rnfr
+        case "RNTO": .rnto
         case "SIZE": .size
         case "MDTM": .mdtm
         default: .unknown(text.uppercased())

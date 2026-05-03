@@ -7,11 +7,13 @@ APP_DIR="$DIST_DIR/LocalFTP.app"
 EXECUTABLE="$ROOT_DIR/.build/release/LocalFTP"
 
 cd "$ROOT_DIR"
+swift scripts/generate_app_icon.swift
 swift build -c release
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
 cp "$EXECUTABLE" "$APP_DIR/Contents/MacOS/LocalFTP"
+cp "$ROOT_DIR/Sources/LocalFTPApp/Resources/AppIcon.icns" "$APP_DIR/Contents/Resources/AppIcon.icns"
 
 cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -26,6 +28,8 @@ cat > "$APP_DIR/Contents/Info.plist" <<'PLIST'
     <string>LocalFTP</string>
     <key>CFBundleDisplayName</key>
     <string>LocalFTP</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

@@ -11,6 +11,22 @@ struct FTPCommandParserTests {
         #expect(command.argument == "hunter")
     }
 
+    @Test("parses extended passive mode")
+    func parsesExtendedPassiveMode() throws {
+        let command = try FTPCommandParser.parse("EPSV")
+
+        #expect(command.verb == .epsv)
+        #expect(command.argument == nil)
+    }
+
+    @Test("parses machine listings and rename commands")
+    func parsesMachineListingsAndRenameCommands() throws {
+        #expect(try FTPCommandParser.parse("MLSD").verb == .mlsd)
+        #expect(try FTPCommandParser.parse("MLST hello.txt").verb == .mlst)
+        #expect(try FTPCommandParser.parse("RNFR old").verb == .rnfr)
+        #expect(try FTPCommandParser.parse("RNTO new").verb == .rnto)
+    }
+
     @Test("preserves spaces inside command arguments")
     func preservesArgumentSpaces() throws {
         let command = try FTPCommandParser.parse("CWD folder with spaces")

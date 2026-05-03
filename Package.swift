@@ -14,7 +14,8 @@ let package = Package(
         .target(name: "FTPServerCore"),
         .executableTarget(
             name: "LocalFTPApp",
-            dependencies: ["FTPServerCore"]
+            dependencies: ["FTPServerCore"],
+            resources: [.copy("Resources/AppIcon.icns")]
         ),
         .testTarget(
             name: "FTPServerCoreTests",

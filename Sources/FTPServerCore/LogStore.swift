@@ -43,6 +43,17 @@ public actor LogStore {
         storage
     }
 
+    public func copyableContents() -> String {
+        if let fileURL,
+           let data = try? Data(contentsOf: fileURL),
+           let contents = String(data: data, encoding: .utf8),
+           !contents.isEmpty {
+            return contents
+        }
+
+        return storage.map(\.formatted).joined(separator: "\n")
+    }
+
     public func append(level: LogLevel, category: LogCategory, message: String) {
         let entry = LogEntry(id: UUID(), timestamp: Date(), level: level, category: category, message: message)
         storage.append(entry)
