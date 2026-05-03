@@ -276,6 +276,47 @@ struct FTPServerIntegrationTests {
         server.stop()
     }
 
+    @Test("keeps the control connection usable across rapid abort retry cycles")
+    func keepsControlConnectionUsableAcrossRapidAbortRetryCycles() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let payload = Data(repeating: 0x61, count: 8 * 1024 * 1024)
+        try payload.write(to: root.appendingPathComponent("payload.bin"))
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+
+        for iteration in 0..<4 {
+            try client.send("EPSV")
+            let firstPort = try extendedPassivePort(from: client.readLine())
+            let firstDataClient = try FTPTestClient(port: firstPort)
+            try client.send("RETR payload.bin")
+            #expect(try client.readLine().hasPrefix("150"))
+            try client.send("ABOR")
+            try drainAbortReplies(client)
+            firstDataClient.close()
+
+            let offset = UInt64((iteration + 1) * 4096)
+            try client.send("EPSV")
+            let retryPort = try extendedPassivePort(from: client.readLine(timeout: 5))
+            let retryDataClient = try FTPTestClient(port: retryPort)
+            try client.send("REST \(offset)")
+            #expect(try client.readLine(timeout: 5).hasPrefix("350"))
+            try client.send("RETR payload.bin")
+            #expect(try client.readLine(timeout: 5).hasPrefix("150"))
+            let downloaded = try retryDataClient.readAllUntilClose(timeout: 5)
+            #expect(try client.readLine(timeout: 5).hasPrefix("226"))
+            #expect(Data(downloaded.utf8).count == payload.count - Int(offset))
+            retryDataClient.close()
+        }
+
+        try client.send("NOOP")
+        #expect(try client.readLine(timeout: 5) == "200 NOOP ok")
+        server.stop()
+    }
+
     @Test("renames directories with RNFR and RNTO")
     func renamesDirectories() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
@@ -473,6 +514,15 @@ private func login(_ client: FTPTestClient) throws {
     _ = try client.readLine()
     try client.send("PASS secret")
     _ = try client.readLine()
+}
+
+private func drainAbortReplies(_ client: FTPTestClient) throws {
+    let first = try client.readLine(timeout: 5)
+    if first.hasPrefix("426") {
+        #expect(try client.readLine(timeout: 5).hasPrefix("226"))
+    } else {
+        #expect(first.hasPrefix("226"))
+    }
 }
 
 private func passivePort(from reply: String) throws -> UInt16 {

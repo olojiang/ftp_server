@@ -598,38 +598,44 @@ private final class FTPSession: @unchecked Sendable {
                 permit.release()
                 return
             }
-            guard !pendingTransfer.isCancelled else {
-                self.clearPendingTransfer(pendingTransfer)
-                permit.release()
-                return
-            }
-            self.send(openingReply)
-            let didStart = self.withDataConnection { [weak self] dataConnection in
+            self.queue.async { [weak self] in
                 guard let self else {
                     permit.release()
-                    dataConnection.cancel()
                     return
                 }
                 guard !pendingTransfer.isCancelled else {
                     self.clearPendingTransfer(pendingTransfer)
                     permit.release()
-                    dataConnection.cancel()
                     return
                 }
-                self.clearPendingTransfer(pendingTransfer)
-                let transfer = ActiveDataTransfer(connection: dataConnection, permit: permit)
-                self.installActiveTransfer(transfer)
-                self.sendChunks(data, offset: 0, transfer: transfer, closingReply: closingReply)
-            } onTimeout: { [weak self] in
-                self?.clearPendingTransfer(pendingTransfer)
-                permit.release()
-                if pendingTransfer.isCancelled == false {
-                    self?.send("425 Data connection timed out")
+                self.send(openingReply)
+                let didStart = self.withDataConnection { [weak self] dataConnection in
+                    guard let self else {
+                        permit.release()
+                        dataConnection.cancel()
+                        return
+                    }
+                    guard !pendingTransfer.isCancelled else {
+                        self.clearPendingTransfer(pendingTransfer)
+                        permit.release()
+                        dataConnection.cancel()
+                        return
+                    }
+                    self.clearPendingTransfer(pendingTransfer)
+                    let transfer = ActiveDataTransfer(connection: dataConnection, permit: permit)
+                    self.installActiveTransfer(transfer)
+                    self.sendChunks(data, offset: 0, transfer: transfer, closingReply: closingReply)
+                } onTimeout: { [weak self] in
+                    self?.clearPendingTransfer(pendingTransfer)
+                    permit.release()
+                    if pendingTransfer.isCancelled == false {
+                        self?.send("425 Data connection timed out")
+                    }
                 }
-            }
-            if !didStart {
-                self.clearPendingTransfer(pendingTransfer)
-                permit.release()
+                if !didStart {
+                    self.clearPendingTransfer(pendingTransfer)
+                    permit.release()
+                }
             }
         }
     }
@@ -651,13 +657,16 @@ private final class FTPSession: @unchecked Sendable {
         let chunk = data.subdata(in: offset..<end)
         transfer.connection.send(content: chunk, completion: .contentProcessed { [weak self] error in
             guard let self else { return }
-            if error != nil {
-                if transfer.finish() {
-                    self.clearActiveTransfer(transfer)
+            self.queue.async { [weak self] in
+                guard let self else { return }
+                if error != nil {
+                    if transfer.finish() {
+                        self.clearActiveTransfer(transfer)
+                    }
+                    return
                 }
-                return
+                self.sendChunks(data, offset: end, transfer: transfer, closingReply: closingReply)
             }
-            self.sendChunks(data, offset: end, transfer: transfer, closingReply: closingReply)
         })
     }
 
@@ -713,45 +722,53 @@ private final class FTPSession: @unchecked Sendable {
                 permit.release()
                 return
             }
-            self.send(openingReply)
-            let didStart = self.withDataConnection { [weak self] dataConnection in
-                guard let session = self else {
+            self.queue.async { [weak self] in
+                guard let self else {
                     permit.release()
                     return
                 }
-                let accumulator = DataAccumulator()
-                let logStore = session.logStore
-                @Sendable func receiveLoop() {
-                    dataConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, _ in
-                        if let data {
-                            accumulator.append(data)
-                        }
-                        if isComplete {
-                            let received = accumulator.data()
-                            do {
-                                try writer(received)
-                                session.send(closingReply)
-                                let byteCount = received.count
-                                Task {
-                                    await logStore.append(level: .info, category: .transfer, message: "received \(byteCount) bytes")
-                                }
-                            } catch {
-                                session.send("550 Cannot save uploaded data")
+                self.send(openingReply)
+                let didStart = self.withDataConnection { [weak self] dataConnection in
+                    guard let session = self else {
+                        permit.release()
+                        return
+                    }
+                    let accumulator = DataAccumulator()
+                    let logStore = session.logStore
+                    @Sendable func receiveLoop() {
+                        dataConnection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { data, _, isComplete, _ in
+                            if let data {
+                                accumulator.append(data)
                             }
-                            permit.release()
-                            dataConnection.cancel()
-                        } else {
-                            receiveLoop()
+                            if isComplete {
+                                session.queue.async {
+                                    let received = accumulator.data()
+                                    do {
+                                        try writer(received)
+                                        session.send(closingReply)
+                                        let byteCount = received.count
+                                        Task {
+                                            await logStore.append(level: .info, category: .transfer, message: "received \(byteCount) bytes")
+                                        }
+                                    } catch {
+                                        session.send("550 Cannot save uploaded data")
+                                    }
+                                    permit.release()
+                                    dataConnection.cancel()
+                                }
+                            } else {
+                                receiveLoop()
+                            }
                         }
                     }
+                    receiveLoop()
+                } onTimeout: { [weak self] in
+                    permit.release()
+                    self?.send("425 Data connection timed out")
                 }
-                receiveLoop()
-            } onTimeout: { [weak self] in
-                permit.release()
-                self?.send("425 Data connection timed out")
-            }
-            if !didStart {
-                permit.release()
+                if !didStart {
+                    permit.release()
+                }
             }
         }
     }
@@ -776,16 +793,30 @@ private final class FTPSession: @unchecked Sendable {
             send("425 Use PASV or PORT first")
             return false
         }
-        passiveDataEndpoint.acquire { [weak self] connection in
-            body(connection)
-            self?.passiveDataEndpoint?.cancel()
-            self?.passiveDataEndpoint = nil
+        let endpoint = passiveDataEndpoint
+        endpoint.acquire { [weak self] connection in
+            self?.queue.async { [weak self] in
+                guard let self else {
+                    connection.cancel()
+                    return
+                }
+                body(connection)
+                self.clearPassiveDataEndpoint(endpoint)
+            }
         } onTimeout: { [weak self] in
-            self?.passiveDataEndpoint?.cancel()
-            self?.passiveDataEndpoint = nil
-            onTimeout()
+            self?.queue.async { [weak self] in
+                guard let self else { return }
+                self.clearPassiveDataEndpoint(endpoint)
+                onTimeout()
+            }
         }
         return true
+    }
+
+    private func clearPassiveDataEndpoint(_ endpoint: PassiveDataEndpoint) {
+        guard passiveDataEndpoint === endpoint else { return }
+        endpoint.cancel()
+        passiveDataEndpoint = nil
     }
 
     private func send(_ line: String) {
