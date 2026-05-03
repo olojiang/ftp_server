@@ -1,7 +1,6 @@
 import AppKit
 import Darwin
 import FTPServerCore
-import Security
 import SwiftUI
 
 @main
@@ -379,8 +378,7 @@ struct AppSettingsStore {
     private let portTextKey = "portText"
     private let usernameKey = "username"
     private let maxConcurrentTransfersTextKey = "maxConcurrentTransfersText"
-    private let keychainService = "dev.local.localftpserver"
-    private let keychainAccount = "ftp-password"
+    private let passwordKey = "password"
 
     var rootDirectory: URL? {
         get {
@@ -408,39 +406,13 @@ struct AppSettingsStore {
     }
 
     var password: String? {
-        get {
-            let query: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: keychainService,
-                kSecAttrAccount as String: keychainAccount,
-                kSecReturnData as String: true,
-                kSecMatchLimit as String: kSecMatchLimitOne
-            ]
-            var item: CFTypeRef?
-            let status = SecItemCopyMatching(query as CFDictionary, &item)
-            guard status == errSecSuccess, let data = item as? Data else { return nil }
-            return String(data: data, encoding: .utf8)
-        }
+        get { defaults.string(forKey: passwordKey) }
         nonmutating set {
-            let baseQuery: [String: Any] = [
-                kSecClass as String: kSecClassGenericPassword,
-                kSecAttrService as String: keychainService,
-                kSecAttrAccount as String: keychainAccount
-            ]
-
             guard let newValue, !newValue.isEmpty else {
-                SecItemDelete(baseQuery as CFDictionary)
+                defaults.removeObject(forKey: passwordKey)
                 return
             }
-
-            let data = Data(newValue.utf8)
-            let updateStatus = SecItemUpdate(baseQuery as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-            if updateStatus == errSecItemNotFound {
-                var addQuery = baseQuery
-                addQuery[kSecValueData as String] = data
-                addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-                SecItemAdd(addQuery as CFDictionary, nil)
-            }
+            defaults.set(newValue, forKey: passwordKey)
         }
     }
 }
