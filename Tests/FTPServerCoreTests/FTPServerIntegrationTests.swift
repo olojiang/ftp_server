@@ -159,6 +159,45 @@ struct FTPServerIntegrationTests {
         server.stop()
     }
 
+    @Test("resumes downloads from REST offsets")
+    func resumesDownloadsFromRestOffsets() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try "0123456789".write(to: root.appendingPathComponent("payload.bin"), atomically: true, encoding: .utf8)
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+        try client.send("REST 4")
+        #expect(try client.readLine().hasPrefix("350"))
+        try client.send("PASV")
+        let downloadPort = try passivePort(from: client.readLine())
+        let downloadDataClient = try FTPTestClient(port: downloadPort)
+        try client.send("RETR payload.bin")
+        #expect(try client.readLine().hasPrefix("150"))
+        let downloaded = try downloadDataClient.readAllUntilClose()
+        #expect(try client.readLine().hasPrefix("226"))
+
+        #expect(downloaded == "456789")
+        server.stop()
+    }
+
+    @Test("accepts ABOR without failing unknown command")
+    func acceptsAbortCommand() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let server = FTPServer(configuration: .init(rootDirectory: root, port: 0, username: "hunter", password: "secret"), logStore: LogStore(maxEntries: 100, fileURL: nil))
+
+        try server.start()
+        let client = try FTPTestClient(port: try server.boundPort())
+        try login(client)
+        try client.send("ABOR")
+
+        #expect(try client.readLine().hasPrefix("226"))
+        server.stop()
+    }
+
     @Test("renames directories with RNFR and RNTO")
     func renamesDirectories() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)

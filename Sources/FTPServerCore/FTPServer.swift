@@ -146,6 +146,7 @@ private final class FTPSession: @unchecked Sendable {
     private var pendingRenameSource: ResolvedFTPPath?
     private var passiveDataEndpoint: PassiveDataEndpoint?
     private var activeDataEndpoint: NWEndpoint?
+    private var restartOffset: UInt64 = 0
 
     init(connection: NWConnection, configuration: FTPServerConfiguration, logStore: LogStore, transferLimiter: TransferLimiter) {
         self.connection = connection
@@ -241,7 +242,7 @@ private final class FTPSession: @unchecked Sendable {
         case .syst:
             send("215 UNIX Type: L8")
         case .feat:
-            sendMultiline("211", lines: ["UTF8", "SIZE", "MDTM", "MLST type*;size*;modify*;", "PASV", "EPSV"], end: "Features")
+            sendMultiline("211", lines: ["UTF8", "SIZE", "MDTM", "REST STREAM", "MLST type*;size*;modify*;", "PASV", "EPSV"], end: "Features")
         case .noop:
             send("200 NOOP ok")
         case .type:
@@ -295,6 +296,10 @@ private final class FTPSession: @unchecked Sendable {
             size(command.argument)
         case .mdtm:
             modificationTime(command.argument)
+        case .rest:
+            restart(command.argument)
+        case .abor:
+            abortTransfer()
         case .unknown(let verb):
             send("502 Command \(verb) not implemented")
         default:
@@ -439,10 +444,35 @@ private final class FTPSession: @unchecked Sendable {
         do {
             let resolved = try resolver.resolve(path, currentDirectory: currentDirectory)
             let data = try Data(contentsOf: resolved.fileURL)
-            sendData(data, openingReply: "150 Opening binary mode data connection", closingReply: "226 Transfer complete")
+            let offset = restartOffset
+            restartOffset = 0
+            guard offset <= UInt64(data.count) else {
+                send("554 Restart offset exceeds file size")
+                return
+            }
+            let payload = offset == 0 ? data : data.subdata(in: Int(offset)..<data.count)
+            sendData(payload, openingReply: "150 Opening binary mode data connection", closingReply: "226 Transfer complete")
         } catch {
+            restartOffset = 0
             send("550 Cannot read file")
         }
+    }
+
+    private func restart(_ marker: String?) {
+        guard let marker, let offset = UInt64(marker.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            send("501 Invalid restart marker")
+            return
+        }
+        restartOffset = offset
+        send("350 Restarting at \(offset). Send STORE or RETR to initiate transfer")
+    }
+
+    private func abortTransfer() {
+        restartOffset = 0
+        passiveDataEndpoint?.cancel()
+        passiveDataEndpoint = nil
+        activeDataEndpoint = nil
+        send("226 Abort successful")
     }
 
     private func store(_ path: String?) {

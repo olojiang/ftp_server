@@ -27,6 +27,8 @@ public enum FTPCommandVerb: Equatable, Sendable {
     case rnto
     case size
     case mdtm
+    case rest
+    case abor
     case unknown(String)
 }
 
@@ -90,6 +92,8 @@ public enum FTPCommandParser {
         case "RNTO": .rnto
         case "SIZE": .size
         case "MDTM": .mdtm
+        case "REST": .rest
+        case "ABOR": .abor
         default: .unknown(text.uppercased())
         }
     }

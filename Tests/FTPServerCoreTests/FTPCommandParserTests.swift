@@ -25,6 +25,8 @@ struct FTPCommandParserTests {
         #expect(try FTPCommandParser.parse("MLST hello.txt").verb == .mlst)
         #expect(try FTPCommandParser.parse("RNFR old").verb == .rnfr)
         #expect(try FTPCommandParser.parse("RNTO new").verb == .rnto)
+        #expect(try FTPCommandParser.parse("REST 42").verb == .rest)
+        #expect(try FTPCommandParser.parse("ABOR").verb == .abor)
     }
 
     @Test("preserves spaces inside command arguments")
